@@ -16,6 +16,8 @@ with > 10 labels, should not take more than a few hours
 
 The default training set are the Kurucz synthetic spectral models and have been
 convolved to the appropriate R (~22500 for APOGEE) with the APOGEE LSF.
+
+This file has been modified by Alex Ji based on https://stanford.edu/~shervine/blog/pytorch-how-to-generate-data-parallel
 '''
 
 from __future__ import absolute_import, division, print_function # python2 compatibility
@@ -112,9 +114,9 @@ class Payne_model(torch.nn.Module):
 #===================================================================================================
 # train neural networks
 def neural_net(training_labels, training_spectra, validation_labels, validation_spectra,\
-             num_neurons = 300, num_steps=1e4, learning_rate=1e-4, batch_size=512,\
-             num_features = 64*5, mask_size=11, num_pixel=7214):
-
+               num_neurons = 300, num_steps=1e4, learning_rate=1e-4, batch_size=512,\
+               num_features = 64*5, mask_size=11, num_pixel=7214, 
+               num_workers=0, training_batch_size=None, validation_batch_size=None):
     '''
     Training a neural net to emulate spectral models
 
@@ -150,8 +152,10 @@ def neural_net(training_labels, training_spectra, validation_labels, validation_
 
     batch_size = the batch size for training the neural networks during the stochastic
     gradient descent. A larger batch_size reduces stochasticity, but it might also
-    risk of stucking in local minima
+    risk of stucking in local minima.
 
+    training_batch_size, validation_batch_size: this decides how big of a chunk of data
+    is loaded onto the GPU at once. By default is the same value as batch_size
     '''
 
     # run on cuda
@@ -172,16 +176,38 @@ def neural_net(training_labels, training_spectra, validation_labels, validation_
     loss_fn = torch.nn.L1Loss(reduction = 'mean')
 
     # make pytorch variables
-    x = Variable(torch.from_numpy(x)).type(dtype)
-    y = Variable(torch.from_numpy(training_spectra), requires_grad=False).type(dtype)
-    x_valid = Variable(torch.from_numpy(x_valid)).type(dtype)
-    y_valid = Variable(torch.from_numpy(validation_spectra), requires_grad=False).type(dtype)
-
+    ### NOTE FROM ALEX: because this automatically puts everything on the GPU,
+    ## it does not work for very large training/validation sets.
+    #x = Variable(torch.from_numpy(x)).type(dtype)
+    #y = Variable(torch.from_numpy(training_spectra), requires_grad=False).type(dtype)
+    #x_valid = Variable(torch.from_numpy(x_valid)).type(dtype)
+    #y_valid = Variable(torch.from_numpy(validation_spectra), requires_grad=False).type(dtype)
+    
+    #### APJ CHANGED HERE
+    ## We will use the torch DataLoader to transfer data to the GPU in batches.
+    ## It will be much slower because it takes like 200 cycles to transfer memory,
+    ## but it will run on arbitrary datasets.
+    if training_batch_size is None: training_batch_size = batch_size
+    if validation_batch_size is None: validation_batch_size = batch_size
+    print("Loading {} at a time for training, {} at a time for validation".format(
+        training_batch_size, validation_batch_size))
+    device = torch.device("cuda:0")
+    training_kws = {"batch_size": training_batch_size,
+                    "shuffle": True,
+                    "num_workers": num_workers}
+    training_set = MySimpleDataset(training_spectra.astype(np.float32), x.astype(np.float32))
+    training_generator = torch.utils.data.DataLoader(training_set, **training_kws)
+    validation_kws = {"batch_size": validation_batch_size,
+                      "shuffle": True,
+                      "num_workers": num_workers}
+    validation_set = MySimpleDataset(validation_spectra.astype(np.float32), x_valid.astype(np.float32))
+    validation_generator = torch.utils.data.DataLoader(validation_set, **validation_kws)
+    
     # initiate Payne and optimizer
     model = Payne_model(dim_in, num_neurons, num_features, mask_size, num_pixel)
     model.cuda()
     model.train()
-
+    
     # we adopt rectified Adam for the optimization
     optimizer = radam.RAdam([p for p in model.parameters() if p.requires_grad==True], lr=learning_rate)
 
@@ -191,7 +217,7 @@ def neural_net(training_labels, training_spectra, validation_labels, validation_
     nbatches = nsamples // batch_size
 
     nsamples_valid = x_valid.shape[0]
-    nbatches_valid = nsamples_valid // batch_size
+    nbatches_valid = nsamples_valid // validation_batch_size
 
     # initiate counter
     current_loss = np.inf
@@ -200,18 +226,33 @@ def neural_net(training_labels, training_spectra, validation_labels, validation_
 
 #-------------------------------------------------------------------------------------------------------
     # train the network
+    start = time.time()
     for e in range(int(num_steps)):
 
-        # randomly permute the data
-        perm = torch.randperm(nsamples)
-        perm = perm.cuda()
+        ### APJ: this is the original training loop.
+        ## # randomly permute the data
+        ## perm = torch.randperm(nsamples)
+        ## perm = perm.cuda()
+        ## 
+        ## # for each batch, calculate the gradient with respect to the loss
+        ## for i in range(nbatches):
+        ##     idx = perm[i * batch_size : (i+1) * batch_size]
+        ##     y_pred = model(x[idx])
+        ## 
+        ##     loss = loss_fn(y_pred, y[idx])*1e4
+        ##     optimizer.zero_grad()
+        ##     loss.backward(retain_graph=False)
+        ##     optimizer.step()
 
-        # for each batch, calculate the gradient with respect to the loss
-        for i in range(nbatches):
-            idx = perm[i * batch_size : (i+1) * batch_size]
-            y_pred = model(x[idx])
-
-            loss = loss_fn(y_pred, y[idx])*1e4
+        ### APJ: new training loop
+        ## Train in batches
+        ## The training generator already shuffles the data
+        for local_batch, local_labels in training_generator:
+            # Transfer from CPU to GPU
+            local_batch, local_labels = local_batch.to(device), local_labels.to(device)
+            # Optimize
+            y_pred = model(local_labels)
+            loss = loss_fn(y_pred, local_batch)*1e4
             optimizer.zero_grad()
             loss.backward(retain_graph=False)
             optimizer.step()
@@ -219,22 +260,35 @@ def neural_net(training_labels, training_spectra, validation_labels, validation_
 #-------------------------------------------------------------------------------------------------------
         # evaluate validation loss
         if e % 100 == 0:
+            start2 = time.time()
 
             # here we also break into batches because when training ResNet
             # evaluating the whole validation set could go beyond the GPU memory
             # if needed, this part can be simplified to reduce overhead
-            perm_valid = torch.randperm(nsamples_valid)
-            perm_valid = perm_valid.cuda()
+            ## perm_valid = torch.randperm(nsamples_valid)
+            ## perm_valid = perm_valid.cuda()
             loss_valid = 0
 
-            for j in range(nbatches_valid):
-                idx = perm_valid[j * batch_size : (j+1) * batch_size]
-                y_pred_valid = model(x_valid[idx])
-                loss_valid += loss_fn(y_pred_valid, y_valid[idx])*1e4
-            loss_valid /= nbatches_valid
+            ### APJ: original validation loop
+            ## for j in range(nbatches_valid):
+            ##     idx = perm_valid[j * batch_size : (j+1) * batch_size]
+            ##     y_pred_valid = model(x_valid[idx])
+            ##     loss_valid += loss_fn(y_pred_valid, y_valid[idx])*1e4
+            ## loss_valid /= nbatches_valid
+            
+            ### APJ: new validation loop
+            with torch.set_grad_enabled(False):
+                for local_batch, local_labels in validation_generator:
+                    local_batch, local_labels = local_batch.to(device), local_labels.to(device)
+                    y_pred_valid = model(local_labels)
+                    loss_valid += loss_fn(y_pred_valid, local_batch)*1e4
+                loss_valid /= nbatches_valid
 
             print('iter %s:' % e, 'training loss = %.3f' % loss,\
-                 'validation loss = %.3f' % loss_valid)
+                  'validation loss = %.3f' % loss_valid,\
+                  'cum time = %.1f' % (time.time()-start), \
+                  'val time = %.1f' % (time.time()-start2))
+            sys.stdout.flush()
 
             loss_data = loss.detach().data.item()
             loss_valid_data = loss_valid.detach().data.item()
@@ -299,3 +353,29 @@ def neural_net(training_labels, training_spectra, validation_labels, validation_
              validation_loss = validation_loss)
 
     return
+
+#===================================================================================================
+# simple class to store large data matrix on CPU
+# could also implement this to read files from disk if you can't store it in memory
+class MySimpleDataset(torch.utils.data.Dataset):
+    """
+    simple class to store large data matrix on CPU
+    """
+    def __init__(self, data, labels):
+        """ Initialization """
+        self.data = data
+        self.labels = labels
+    
+    def __len__(self):
+        """Denotes the total number of samples"""
+        return len(self.labels)
+    
+    def __getitem__(self, index):
+        """Generates one sample of data"""
+        X = self.data[index]
+        y = self.labels[index]
+        
+        return X, y
+
+
+    
